@@ -186,6 +186,72 @@ impl<T> ArrayQueue<T> {
 
     /// Attempts to push an element into the queue.
     ///
+    /// If the queue is full or contended, the element is returned back as an error.
+    ///
+    /// This method is guaranteed to never block.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use crossbeam_queue::ArrayQueue;
+    ///
+    /// let q = ArrayQueue::new(1);
+    ///
+    /// assert_eq!(q.try_push(10), Ok(()));
+    /// assert_eq!(q.try_push(20), Err(20));
+    /// ```
+    pub fn try_push(&self, value: T) -> Result<(), T> {
+        let tail = self.tail.load(Ordering::Relaxed);
+
+        // Deconstruct the tail.
+        let index = tail & (self.one_lap - 1);
+        let lap = tail & !(self.one_lap - 1);
+
+        let new_tail = if index + 1 < self.capacity() {
+            // Same lap, incremented index.
+            // Set to `{ lap: lap, index: index + 1 }`.
+            tail + 1
+        } else {
+            // One lap forward, index wraps around to zero.
+            // Set to `{ lap: lap.wrapping_add(1), index: 0 }`.
+            lap.wrapping_add(self.one_lap)
+        };
+
+        // Inspect the corresponding slot.
+        debug_assert!(index < self.buffer.len());
+        let slot = unsafe { self.buffer.get_unchecked(index) };
+        let stamp = slot.stamp.load(Ordering::Acquire);
+
+        // If the tail and the stamp match, we may attempt to push.
+        if tail == stamp {
+            // Try moving the tail.
+            match self.tail.compare_exchange_weak(
+                tail,
+                new_tail,
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    // Write the value into the slot and update the stamp.
+                    unsafe {
+                        slot.value.get().write(MaybeUninit::new(value));
+                    }
+                    slot.stamp.store(tail + 1, Ordering::Release);
+                    Ok(())
+                }
+                Err(_) => {
+                    // we are contended, but cannot spin, thus the push fails
+                    Err(value)
+                }
+            }
+        } else {
+            // Queue may have space, but we cannot wait for updates on contended queue, thus we fail
+            Err(value)
+        }
+    }
+
+    /// Attempts to push an element into the queue.
+    ///
     /// If the queue is full, the element is returned back as an error.
     ///
     /// # Examples

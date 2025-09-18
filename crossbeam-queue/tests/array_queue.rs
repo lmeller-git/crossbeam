@@ -152,6 +152,37 @@ fn spsc() {
 }
 
 #[test]
+fn spsc_no_block() {
+    #[cfg(miri)]
+    const COUNT: usize = 50;
+    #[cfg(not(miri))]
+    const COUNT: usize = 100_000;
+
+    let q = ArrayQueue::new(3);
+
+    scope(|scope| {
+        scope.spawn(|_| {
+            for i in 0..COUNT {
+                loop {
+                    if let Some(x) = q.pop() {
+                        assert_eq!(x, i);
+                        break;
+                    }
+                }
+            }
+            assert!(q.pop().is_none());
+        });
+
+        scope.spawn(|_| {
+            for i in 0..COUNT {
+                while q.try_push(i).is_err() {}
+            }
+        });
+    })
+    .unwrap();
+}
+
+#[test]
 fn spsc_ring_buffer() {
     #[cfg(miri)]
     const COUNT: usize = 50;
@@ -220,6 +251,45 @@ fn mpmc() {
             scope.spawn(|_| {
                 for i in 0..COUNT {
                     while q.push(i).is_err() {}
+                }
+            });
+        }
+    })
+    .unwrap();
+
+    for c in v {
+        assert_eq!(c.load(Ordering::SeqCst), THREADS);
+    }
+}
+
+#[test]
+fn mpmc_no_block() {
+    #[cfg(miri)]
+    const COUNT: usize = 50;
+    #[cfg(not(miri))]
+    const COUNT: usize = 25_000;
+    const THREADS: usize = 4;
+
+    let q = ArrayQueue::<usize>::new(3);
+    let v = (0..COUNT).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>();
+
+    scope(|scope| {
+        for _ in 0..THREADS {
+            scope.spawn(|_| {
+                for _ in 0..COUNT {
+                    let n = loop {
+                        if let Some(x) = q.pop() {
+                            break x;
+                        }
+                    };
+                    v[n].fetch_add(1, Ordering::SeqCst);
+                }
+            });
+        }
+        for _ in 0..THREADS {
+            scope.spawn(|_| {
+                for i in 0..COUNT {
+                    while q.try_push(i).is_err() {}
                 }
             });
         }
