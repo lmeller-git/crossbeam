@@ -184,69 +184,61 @@ impl<T> ArrayQueue<T> {
         }
     }
 
-    /// Attempts to push an element into the queue.
-    ///
-    /// If the queue is full or contended, the element is returned back as an error.
-    ///
-    /// This method is guaranteed to never block.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use crossbeam_queue::ArrayQueue;
-    ///
-    /// let q = ArrayQueue::new(1);
-    ///
-    /// assert_eq!(q.try_push(10), Ok(()));
-    /// assert_eq!(q.try_push(20), Err(20));
-    /// ```
-    pub fn try_push(&self, value: T) -> Result<(), T> {
-        let tail = self.tail.load(Ordering::Relaxed);
+    fn try_push_or_else<F>(&self, mut value: T, f: F) -> Result<(), T>
+    where
+        F: Fn(T, usize, usize, &Slot<T>) -> Result<T, T>,
+    {
+        let mut tail = self.tail.load(Ordering::Relaxed);
+        loop {
+            // Deconstruct the tail.
+            let index = tail & (self.one_lap - 1);
+            let lap = tail & !(self.one_lap - 1);
 
-        // Deconstruct the tail.
-        let index = tail & (self.one_lap - 1);
-        let lap = tail & !(self.one_lap - 1);
+            let new_tail = if index + 1 < self.capacity() {
+                // Same lap, incremented index.
+                // Set to `{ lap: lap, index: index + 1 }`.
+                tail + 1
+            } else {
+                // One lap forward, index wraps around to zero.
+                // Set to `{ lap: lap.wrapping_add(1), index: 0 }`.
+                lap.wrapping_add(self.one_lap)
+            };
 
-        let new_tail = if index + 1 < self.capacity() {
-            // Same lap, incremented index.
-            // Set to `{ lap: lap, index: index + 1 }`.
-            tail + 1
-        } else {
-            // One lap forward, index wraps around to zero.
-            // Set to `{ lap: lap.wrapping_add(1), index: 0 }`.
-            lap.wrapping_add(self.one_lap)
-        };
+            // Inspect the corresponding slot.
+            debug_assert!(index < self.buffer.len());
+            let slot = unsafe { self.buffer.get_unchecked(index) };
+            let stamp = slot.stamp.load(Ordering::Acquire);
 
-        // Inspect the corresponding slot.
-        debug_assert!(index < self.buffer.len());
-        let slot = unsafe { self.buffer.get_unchecked(index) };
-        let stamp = slot.stamp.load(Ordering::Acquire);
-
-        // If the tail and the stamp match, we may attempt to push.
-        if tail == stamp {
-            // Try moving the tail.
-            match self.tail.compare_exchange_weak(
-                tail,
-                new_tail,
-                Ordering::SeqCst,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    // Write the value into the slot and update the stamp.
-                    unsafe {
-                        slot.value.get().write(MaybeUninit::new(value));
+            // If the tail and the stamp match, we may attempt to push.
+            if tail == stamp {
+                // Try moving the tail.
+                match self.tail.compare_exchange_weak(
+                    tail,
+                    new_tail,
+                    Ordering::SeqCst,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => {
+                        // Write the value into the slot and update the stamp.
+                        unsafe {
+                            slot.value.get().write(MaybeUninit::new(value));
+                        }
+                        slot.stamp.store(tail + 1, Ordering::Release);
+                        return Ok(());
                     }
-                    slot.stamp.store(tail + 1, Ordering::Release);
-                    Ok(())
+                    Err(_) => {
+                        // we are contended, but cannot spin, thus the push fails
+                        return Err(value);
+                    }
                 }
-                Err(_) => {
-                    // we are contended, but cannot spin, thus the push fails
-                    Err(value)
-                }
+            } else if stamp.wrapping_add(self.one_lap) == tail + 1 {
+                atomic::fence(Ordering::SeqCst);
+                value = f(value, tail, new_tail, slot)?;
+                tail = self.tail.load(Ordering::Relaxed);
+            } else {
+                // Return because we need to wait for the stamp to get updated.
+                return Err(value);
             }
-        } else {
-            // Queue may have space, but we cannot wait for updates on contended queue, thus we fail
-            Err(value)
         }
     }
 
@@ -297,6 +289,85 @@ impl<T> ArrayQueue<T> {
     /// ```
     pub fn force_push(&self, value: T) -> Option<T> {
         self.push_or_else(value, |v, tail, new_tail, slot| {
+            let head = tail.wrapping_sub(self.one_lap);
+            let new_head = new_tail.wrapping_sub(self.one_lap);
+
+            // Try moving the head.
+            if self
+                .head
+                .compare_exchange_weak(head, new_head, Ordering::SeqCst, Ordering::Relaxed)
+                .is_ok()
+            {
+                // Move the tail.
+                self.tail.store(new_tail, Ordering::SeqCst);
+
+                // Swap the previous value.
+                let old = unsafe { slot.value.get().replace(MaybeUninit::new(v)).assume_init() };
+
+                // Update the stamp.
+                slot.stamp.store(tail + 1, Ordering::Release);
+
+                Err(old)
+            } else {
+                Ok(v)
+            }
+        })
+        .err()
+    }
+
+    /// Attempts to push an element into the queue.
+    ///
+    /// If the queue is full or contended, the element is returned back as an error.
+    ///
+    /// This method is guaranteed to never block.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use crossbeam_queue::ArrayQueue;
+    ///
+    /// let q = ArrayQueue::new(1);
+    ///
+    /// assert_eq!(q.try_push(10), Ok(()));
+    /// assert_eq!(q.try_push(20), Err(20));
+    /// ```
+    pub fn try_push(&self, value: T) -> Result<(), T> {
+        self.push_or_else(value, |v, tail, _, _| {
+            let head = self.head.load(Ordering::Relaxed);
+
+            // If the head lags one lap behind the tail as well...
+            if head.wrapping_add(self.one_lap) == tail {
+                // ...then the queue is full.
+                Err(v)
+            } else {
+                Ok(v)
+            }
+        })
+    }
+
+    /// Attempts to push an element into the queue, replacing the oldest element if necessary.
+    ///
+    /// If the queue is full, the oldest element is replaced and returned,
+    /// otherwise `None` is returned.
+    ///
+    /// If the queue is contended, `None` will be returned and the queue will NOT be updated.
+    ///
+    /// This method is guaranteed to never block.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use crossbeam_queue::ArrayQueue;
+    ///
+    /// let q = ArrayQueue::new(2);
+    ///
+    /// assert_eq!(q.try_force_push(10), None);
+    /// assert_eq!(q.try_force_push(20), None);
+    /// assert_eq!(q.try_force_push(30), Some(10));
+    /// assert_eq!(q.pop(), Some(20));
+    /// ```
+    pub fn try_force_push(&self, value: T) -> Option<T> {
+        self.try_push_or_else(value, |v, tail, new_tail, slot| {
             let head = tail.wrapping_sub(self.one_lap);
             let new_head = new_tail.wrapping_sub(self.one_lap);
 

@@ -224,6 +224,47 @@ fn spsc_ring_buffer() {
 }
 
 #[test]
+fn spsc_ring_buffer_no_block() {
+    #[cfg(miri)]
+    const COUNT: usize = 50;
+    #[cfg(not(miri))]
+    const COUNT: usize = 100_000;
+
+    let t = AtomicUsize::new(1);
+    let q = ArrayQueue::<usize>::new(3);
+    let v = (0..COUNT).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>();
+
+    scope(|scope| {
+        scope.spawn(|_| loop {
+            match t.load(Ordering::SeqCst) {
+                0 if q.is_empty() => break,
+
+                _ => {
+                    while let Some(n) = q.pop() {
+                        v[n].fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            }
+        });
+
+        scope.spawn(|_| {
+            for i in 0..COUNT {
+                if let Some(n) = q.try_force_push(i) {
+                    v[n].fetch_add(1, Ordering::SeqCst);
+                }
+            }
+
+            t.fetch_sub(1, Ordering::SeqCst);
+        });
+    })
+    .unwrap();
+
+    for c in v {
+        assert_eq!(c.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[test]
 fn mpmc() {
     #[cfg(miri)]
     const COUNT: usize = 50;
@@ -332,6 +373,52 @@ fn mpmc_ring_buffer() {
             scope.spawn(|_| {
                 for i in 0..COUNT {
                     if let Some(n) = q.force_push(i) {
+                        v[n].fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+
+                t.fetch_sub(1, Ordering::SeqCst);
+            });
+        }
+    })
+    .unwrap();
+
+    for c in v {
+        assert_eq!(c.load(Ordering::SeqCst), THREADS);
+    }
+}
+
+#[test]
+fn mpmc_ring_buffer_no_block() {
+    #[cfg(miri)]
+    const COUNT: usize = 50;
+    #[cfg(not(miri))]
+    const COUNT: usize = 25_000;
+    const THREADS: usize = 4;
+
+    let t = AtomicUsize::new(THREADS);
+    let q = ArrayQueue::<usize>::new(3);
+    let v = (0..COUNT).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>();
+
+    scope(|scope| {
+        for _ in 0..THREADS {
+            scope.spawn(|_| loop {
+                match t.load(Ordering::SeqCst) {
+                    0 if q.is_empty() => break,
+
+                    _ => {
+                        while let Some(n) = q.pop() {
+                            v[n].fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                }
+            });
+        }
+
+        for _ in 0..THREADS {
+            scope.spawn(|_| {
+                for i in 0..COUNT {
+                    if let Some(n) = q.try_force_push(i) {
                         v[n].fetch_add(1, Ordering::SeqCst);
                     }
                 }
